@@ -41,6 +41,32 @@ rules:
     - update
     - watch
 - apiGroups:
+    - ""
+  resources:
+    - pods
+  verbs:
+    - get
+    - list
+    - patch
+    - update
+    - watch
+- apiGroups:
+    - ""
+  resources:
+    - pods/status
+  verbs:
+    - get
+- apiGroups:
+    - apps
+  resources:
+    - daemonsets
+    - replicasets
+    - statefulsets
+  verbs:
+    - get
+    - list
+    - watch
+- apiGroups:
     - apps
   resources:
     - deployments
@@ -63,6 +89,14 @@ rules:
     - list
     - patch
     - update
+    - watch
+- apiGroups:
+    - batch
+  resources:
+    - jobs
+  verbs:
+    - get
+    - list
     - watch
 - apiGroups:
     - cilium.io
