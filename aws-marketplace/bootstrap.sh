@@ -37,21 +37,21 @@ wait_cert() {
   kubectl wait --for=condition=Ready "certificate/${name}" -n "${ns}" --timeout="${timeout}s"
 }
 
-# ── Required env vars (set by CodeBuild) ─────────────────────────────────────
+# ── Required env vars (set by CodeBuild from CloudFormation) ─────────────────
 : "${STACK_NAME:?}" "${AWS_REGION:?}" "${OPENCHOREO_VERSION:?}"
+: "${BaseDomain:?}" "${ClusterName:?}" "${VpcId:?}" "${PublicSubnets:?}"
+: "${DBEndpoint:?}" "${ECRUri:?}" "${CognitoUserPoolId:?}"
+: "${CognitoIssuerUrl:?}" "${CognitoJwksUrl:?}" "${CognitoDomainUrl:?}"
+: "${BackstageClientId:?}" "${CLIClientId:?}"
+: "${CPEIPAllocationId:?}" "${CPEIPAddress:?}" "${CPEIP2AllocationId:?}"
+: "${DPEIPAllocationId:?}" "${DPEIPAddress:?}" "${DPEIP2AllocationId:?}"
+: "${ESORoleArn:?}" "${LBCRoleArn:?}" "${BuildRoleArn:?}"
 
 export RELEASE_BRANCH="release-v${OPENCHOREO_VERSION%.*}"
 REPO_DIR="/tmp/openchoreo"
 SCRIPT_DIR="${REPO_DIR}/install/aws"
-
-# ── Step 1: Export CloudFormation outputs ────────────────────────────────────
-log "Step 1: Exporting CloudFormation outputs..."
-
-eval "$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
-  --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output text | \
-  awk '{print "export "$1"=\""$2"\""}')"
-
 export BASE_DOMAIN="$BaseDomain"
+
 log "Cluster: $ClusterName | CP IP: $CPEIPAddress | DP IP: $DPEIPAddress"
 
 # ── Step 2: Configure kubectl ────────────────────────────────────────────────

@@ -788,6 +788,48 @@ Resources:
             Value: !Ref AWS::Region
           - Name: OPENCHOREO_VERSION
             Value: !Ref OpenChoreoVersion
+          - Name: BaseDomain
+            Value: !Ref BaseDomain
+          - Name: ClusterName
+            Value: !Ref Cluster
+          - Name: VpcId
+            Value: !Ref VPC
+          - Name: PublicSubnets
+            Value: !Sub ${PubSub1},${PubSub2}
+          - Name: DBEndpoint
+            Value: !GetAtt DB.Endpoint.Address
+          - Name: ECRUri
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/openchoreo-builds
+          - Name: CognitoUserPoolId
+            Value: !Ref UserPool
+          - Name: CognitoIssuerUrl
+            Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+          - Name: CognitoJwksUrl
+            Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/jwks.json
+          - Name: CognitoDomainUrl
+            Value: !Sub https://${AWS::StackName}-auth.auth.${AWS::Region}.amazoncognito.com
+          - Name: BackstageClientId
+            Value: !Ref BackstageClient
+          - Name: CLIClientId
+            Value: !Ref CLIClient
+          - Name: CPEIPAllocationId
+            Value: !GetAtt CPEIP.AllocationId
+          - Name: CPEIPAddress
+            Value: !Ref CPEIP
+          - Name: CPEIP2AllocationId
+            Value: !GetAtt CPEIP2.AllocationId
+          - Name: DPEIPAllocationId
+            Value: !GetAtt DPEIP.AllocationId
+          - Name: DPEIPAddress
+            Value: !Ref DPEIP
+          - Name: DPEIP2AllocationId
+            Value: !GetAtt DPEIP2.AllocationId
+          - Name: ESORoleArn
+            Value: !GetAtt ESORole.Arn
+          - Name: LBCRoleArn
+            Value: !GetAtt LBCRole.Arn
+          - Name: BuildRoleArn
+            Value: !GetAtt BuildRole.Arn
       Artifacts:
         Type: NO_ARTIFACTS
       Source:
