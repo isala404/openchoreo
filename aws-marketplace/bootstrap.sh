@@ -636,23 +636,46 @@ envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --inst
   -f -
 
 log "Installing observability-logs-opensearch module..."
-# The opensearch-setup-logs post-install job may fail if OpenSearch pods aren't ready.
-# Retry up to 3 times with cleanup between attempts.
-for attempt in 1 2 3; do
-  if helm upgrade --install observability-logs-opensearch \
-    oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
-    --namespace openchoreo-observability-plane \
-    --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
-    --timeout 15m \
-    --wait 2>&1; then
+# Install without --wait so helm doesn't block on the post-install setup job.
+# The setup job needs OpenSearch running, which takes several minutes to start.
+helm upgrade --install observability-logs-opensearch \
+  oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
+  --namespace openchoreo-observability-plane \
+  --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
+  --timeout 15m
+
+# Wait for OpenSearch cluster pods to be ready
+log "Waiting for OpenSearch cluster pods to be ready..."
+for i in $(seq 1 90); do
+  READY=$(kubectl get pods -n openchoreo-observability-plane \
+    -l opster.io/opensearch-cluster -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  if [[ "$READY" == *"True"* ]]; then
+    log "OpenSearch pods are ready"
     break
   fi
-  warn "observability-logs-opensearch attempt $attempt failed, retrying..."
-  # Delete failed hook jobs so helm can retry
-  kubectl delete jobs -n openchoreo-observability-plane -l app.kubernetes.io/instance=observability-logs-opensearch 2>/dev/null || true
-  helm uninstall observability-logs-opensearch -n openchoreo-observability-plane 2>/dev/null || true
-  sleep 30
+  if (( i % 10 == 0 )); then log "Still waiting for OpenSearch pods... (${i}/90)"; fi
+  sleep 10
 done
+
+# Check if the setup job succeeded, if not delete and recreate it
+SETUP_JOB=$(kubectl get jobs -n openchoreo-observability-plane -o name 2>/dev/null | grep opensearch-setup-logs || true)
+if [[ -n "$SETUP_JOB" ]]; then
+  JOB_STATUS=$(kubectl get "$SETUP_JOB" -n openchoreo-observability-plane -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+  if [[ "$JOB_STATUS" != "True" ]]; then
+    log "Setup job hasn't completed yet, deleting and recreating..."
+    kubectl delete "$SETUP_JOB" -n openchoreo-observability-plane 2>/dev/null || true
+    sleep 5
+    # Upgrade with same values re-triggers hooks
+    helm upgrade observability-logs-opensearch \
+      oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
+      --namespace openchoreo-observability-plane \
+      --reuse-values \
+      --timeout 10m \
+      --wait
+  else
+    log "Setup job already completed successfully"
+  fi
+fi
 
 log "Enabling fluent-bit on observability-logs-opensearch..."
 helm upgrade observability-logs-opensearch \
