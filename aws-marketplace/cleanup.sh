@@ -43,7 +43,7 @@ log "Step 1: Exporting CloudFormation outputs..."
 
 eval "$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
   --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output text 2>/dev/null | \
-  awk '{print "export "$1"=\""$2"\""}')" 2>/dev/null || true
+  awk -F'\t' 'NF==2 && $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {print "export "$1"=\""$2"\""}')" 2>/dev/null || true
 
 # ── Step 2: Configure kubectl ────────────────────────────────────────────────
 log "Step 2: Configuring kubectl..."

@@ -54,7 +54,7 @@ log "Step 1: Loading Phase 1 stack outputs..."
 
 eval "$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" \
   --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output text | \
-  awk '{print "export "$1"=\""$2"\""}')"
+  awk -F'\t' 'NF==2 && $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {print "export "$1"=\""$2"\""}')"
 
 export BASE_DOMAIN="$BaseDomain"
 
