@@ -1,0 +1,70 @@
+security:
+  oidc:
+    issuer: "${COGNITO_ISSUER_URL}"
+    wellKnownEndpoint: "${COGNITO_ISSUER_URL}/.well-known/openid-configuration"
+    jwksUrl: "${COGNITO_JWKS_URL}"
+    authorizationUrl: "${COGNITO_DOMAIN_URL}/oauth2/authorize"
+    tokenUrl: "${COGNITO_DOMAIN_URL}/oauth2/token"
+    externalClients:
+      - name: cli
+        client_id: "${CLI_CLIENT_ID}"
+        scopes:
+          - "openid"
+          - "profile"
+          - "email"
+
+openchoreoApi:
+  http:
+    hostnames:
+      - "api.${BASE_DOMAIN}"
+  config:
+    server:
+      publicUrl: "https://api.${BASE_DOMAIN}"
+    security:
+      subjects:
+        user:
+          mechanisms:
+            jwt:
+              entitlement:
+                claim: "cognito:groups"
+      authorization:
+        bootstrap:
+          mappings:
+            - name: super-admin-binding
+              roleRef: {name: super-admin}
+              entitlement: {claim: "cognito:groups", value: admin}
+              effect: allow
+            - name: backstage-catalog-reader-binding
+              roleRef: {name: backstage-catalog-reader}
+              entitlement: {claim: sub, value: "${BACKEND_CLIENT_ID}"}
+              effect: allow
+
+gateway:
+  infrastructure:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+      service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "${CP_EIP_ALLOCATIONS}"
+      service.beta.kubernetes.io/aws-load-balancer-subnets: "${PUBLIC_SUBNETS}"
+      service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+  tls:
+    hostname: "*.${BASE_DOMAIN}"
+    certificateRefs:
+      - name: control-plane-tls
+
+backstage:
+  secretName: openchoreo-backstage-secrets
+  baseUrl: "https://console.${BASE_DOMAIN}"
+  http:
+    hostnames:
+      - "console.${BASE_DOMAIN}"
+  auth:
+    clientId: ${BACKSTAGE_CLIENT_ID}
+  database:
+    type: postgresql
+    postgresql:
+      ssl: true
+  extraEnv:
+    - name: NODE_TLS_REJECT_UNAUTHORIZED
+      value: "0"

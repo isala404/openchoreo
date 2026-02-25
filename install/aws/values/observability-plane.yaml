@@ -1,0 +1,59 @@
+security:
+  oidc:
+    jwksUrl: "${COGNITO_JWKS_URL}"
+    tokenUrl: "${COGNITO_DOMAIN_URL}/oauth2/token"
+
+clusterAgent:
+  planeID: observabilityplane
+  tls:
+    generateCerts: true
+
+observer:
+  openSearchSecretName: observer-opensearch-credentials
+  controlPlaneApiUrl: "http://openchoreo-api.openchoreo-control-plane.svc.cluster.local:8080"
+  extraEnvs:
+    - name: OBSERVER_BASE_URL
+      value: "http://localhost:11080"
+    - name: OPENSEARCH_ADDRESS
+      value: "https://opensearch:9200"
+    - name: PROMETHEUS_ADDRESS
+      value: "http://openchoreo-observability-prometheus:9091"
+    - name: PROMETHEUS_TIMEOUT
+      value: "30s"
+    - name: AUTHZ_TIMEOUT
+      value: "30s"
+    - name: AUTH_SERVER_BASE_URL
+      value: "${COGNITO_DOMAIN_URL}"
+  security:
+    userTypes:
+      - type: "user"
+        display_name: "User"
+        priority: 1
+        auth_mechanisms:
+          - type: "jwt"
+            entitlement:
+              claim: "cognito:groups"
+              display_name: "User Group"
+      - type: "service_account"
+        display_name: "Service Account"
+        priority: 2
+        auth_mechanisms:
+          - type: "jwt"
+            entitlement:
+              claim: "sub"
+              display_name: "Client ID"
+
+gateway:
+  enabled: false
+
+openSearchCluster:
+  enabled: false
+
+fluent-bit:
+  enabled: false
+
+opentelemetry-collector:
+  enabled: false
+
+openSearch:
+  enabled: false

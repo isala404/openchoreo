@@ -1,0 +1,7 @@
+clusterAgent:
+  planeID: buildplane
+  tls:
+    generateCerts: true
+
+openbao:
+  enabled: false
