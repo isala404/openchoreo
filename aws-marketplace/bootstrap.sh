@@ -622,6 +622,12 @@ kubectl create secret generic observer-opensearch-credentials \
   --from-literal=password=admin \
   --dry-run=client -o yaml | kubectl apply -f -
 
+kubectl create secret generic opensearch-admin-credentials \
+  --namespace openchoreo-observability-plane \
+  --from-literal=username=admin \
+  --from-literal=password=admin \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --install openchoreo-observability-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-observability-plane \
   --namespace openchoreo-observability-plane \
@@ -633,6 +639,7 @@ log "Installing observability-logs-opensearch module..."
 helm upgrade --install observability-logs-opensearch \
   oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
   --namespace openchoreo-observability-plane \
+  --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
   --timeout 15m \
   --wait
 
