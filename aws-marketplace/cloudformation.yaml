@@ -451,6 +451,8 @@ Resources:
       Name: !Ref AWS::StackName
       Version: !Ref EKSVersion
       RoleArn: !GetAtt EKSRole.Arn
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
       ResourcesVpcConfig:
         SubnetIds: [!Ref PubSub1, !Ref PubSub2, !Ref PrivSub1, !Ref PrivSub2]
         SecurityGroupIds: [!Ref ClusterSG]
