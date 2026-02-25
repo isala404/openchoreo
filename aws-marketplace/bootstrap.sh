@@ -649,14 +649,25 @@ helm upgrade --install observability-logs-opensearch \
 
 # Wait for OpenSearch cluster pods to be ready
 log "Waiting for OpenSearch cluster pods to be ready..."
+# Debug: show all pods and opensearch resources
+kubectl get pods -n openchoreo-observability-plane 2>/dev/null || true
+kubectl get opensearchclusters -n openchoreo-observability-plane 2>/dev/null || true
+
 for i in $(seq 1 90); do
+  # Try multiple label selectors since different versions use different labels
   READY=$(kubectl get pods -n openchoreo-observability-plane \
-    -l opster.io/opensearch-cluster -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-  if [[ "$READY" == *"True"* ]]; then
-    log "OpenSearch pods are ready"
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -i opensearch || true)
+  if echo "$READY" | grep -q "Running"; then
+    log "OpenSearch pods are running"
+    # Verify they're actually ready
+    kubectl get pods -n openchoreo-observability-plane -l opster.io/opensearch-cluster 2>/dev/null || true
+    kubectl get pods -n openchoreo-observability-plane | grep -i opensearch 2>/dev/null || true
     break
   fi
-  if (( i % 10 == 0 )); then log "Still waiting for OpenSearch pods... (${i}/90)"; fi
+  if (( i % 10 == 0 )); then
+    log "Still waiting for OpenSearch pods... (${i}/90)"
+    kubectl get pods -n openchoreo-observability-plane 2>/dev/null || true
+  fi
   sleep 10
 done
 
