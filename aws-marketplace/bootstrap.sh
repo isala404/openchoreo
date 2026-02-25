@@ -619,13 +619,13 @@ helm upgrade --install opensearch-operator opensearch-operator/opensearch-operat
 kubectl create secret generic observer-opensearch-credentials \
   --namespace openchoreo-observability-plane \
   --from-literal=username=admin \
-  --from-literal=password=admin \
+  --from-literal=password=ThisIsTheOpenSearchPassword1 \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create secret generic opensearch-admin-credentials \
   --namespace openchoreo-observability-plane \
   --from-literal=username=admin \
-  --from-literal=password=admin \
+  --from-literal=password=ThisIsTheOpenSearchPassword1 \
   --dry-run=client -o yaml | kubectl apply -f -
 
 envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --install openchoreo-observability-plane \
@@ -647,31 +647,19 @@ helm upgrade --install observability-logs-opensearch \
   --timeout 15m \
   --wait
 
-# Wait for OpenSearch cluster pods to be ready
-log "Waiting for OpenSearch cluster pods to be ready..."
-# Debug: show all pods and opensearch resources
-kubectl get pods -n openchoreo-observability-plane 2>/dev/null || true
-kubectl get opensearchclusters -n openchoreo-observability-plane 2>/dev/null || true
-
-for i in $(seq 1 90); do
-  # Try multiple label selectors since different versions use different labels
-  READY=$(kubectl get pods -n openchoreo-observability-plane \
-    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -i opensearch || true)
-  if echo "$READY" | grep -q "Running"; then
-    log "OpenSearch pods are running"
-    # Verify they're actually ready
-    kubectl get pods -n openchoreo-observability-plane -l opster.io/opensearch-cluster 2>/dev/null || true
-    kubectl get pods -n openchoreo-observability-plane | grep -i opensearch 2>/dev/null || true
+# Wait for OpenSearch pods to be ready before triggering setup hooks
+log "Waiting for OpenSearch pods..."
+for i in $(seq 1 60); do
+  if kubectl get pods -n openchoreo-observability-plane -l opster.io/opensearch-cluster \
+    -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True; then
+    log "OpenSearch pods are ready"
     break
   fi
-  if (( i % 10 == 0 )); then
-    log "Still waiting for OpenSearch pods... (${i}/90)"
-    kubectl get pods -n openchoreo-observability-plane 2>/dev/null || true
-  fi
+  if (( i % 10 == 0 )); then log "Still waiting for OpenSearch pods... (${i}/60)"; fi
   sleep 10
 done
 
-# Now trigger the setup job via helm upgrade (post-upgrade hook)
+# Trigger setup hooks now that OpenSearch is ready
 log "Running helm upgrade to trigger opensearch setup hooks..."
 helm upgrade observability-logs-opensearch \
   oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
