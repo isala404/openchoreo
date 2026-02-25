@@ -24,11 +24,13 @@ signal_failure() {
   if [[ -n "${WAIT_CONDITION_URL:-}" ]]; then
     curl -s -X PUT "$WAIT_CONDITION_URL" \
       -H "Content-Type:" \
-      -d "{\"Status\":\"FAILURE\",\"Reason\":\"Bootstrap failed at line ${BASH_LINENO[0]} (exit ${exit_code})\",\"UniqueId\":\"bootstrap\",\"Data\":\"failed\"}"
+      -d "{\"Status\":\"FAILURE\",\"Reason\":\"Bootstrap failed at line ${BASH_LINENO[0]:-unknown} (exit ${exit_code})\",\"UniqueId\":\"bootstrap\",\"Data\":\"failed\"}" || true
   fi
   exit "$exit_code"
 }
 
+# EXIT catches all failures including set -u unbound variables (ERR doesn't)
+trap 'if [[ $? -ne 0 ]]; then signal_failure; fi' EXIT
 trap signal_failure ERR
 
 wait_cert() {
@@ -680,4 +682,6 @@ log "Bootstrap complete."
 log "Console: https://console.${BASE_DOMAIN} (self-signed cert)"
 log "API:     https://api.${BASE_DOMAIN}"
 
+# Clear the failure trap before signaling success
+trap - EXIT ERR
 signal_success
