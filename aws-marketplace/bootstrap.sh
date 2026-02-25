@@ -635,6 +635,17 @@ envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --inst
   --timeout 15m \
   -f -
 
+log "Waiting for OpenSearch cluster to be ready..."
+for i in $(seq 1 60); do
+  PHASE=$(kubectl get opensearchclusters -n openchoreo-observability-plane -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+  if [[ "$PHASE" == "RUNNING" ]]; then
+    log "OpenSearch cluster is running"
+    break
+  fi
+  log "OpenSearch phase: ${PHASE:-unknown} (attempt $i/60)"
+  sleep 10
+done
+
 log "Installing observability-logs-opensearch module..."
 helm upgrade --install observability-logs-opensearch \
   oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
