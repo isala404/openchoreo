@@ -1,0 +1,1039 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenChoreo AWS Marketplace - Phase 1 (infra + CodeBuild bootstrap with self-signed TLS)
+
+Parameters:
+  BaseDomain:
+    Type: String
+    Description: Base domain (e.g. openchoreo.example.com)
+  AdminEmail:
+    Type: String
+    Description: Email for the initial admin user (receives temporary password)
+  OpenChoreoVersion:
+    Type: String
+    Default: '0.16.0'
+    Description: OpenChoreo release version
+  EKSVersion:
+    Type: String
+    Default: '1.33'
+  NodeInstanceType:
+    Type: String
+    Default: m5.xlarge
+  NodeCount:
+    Type: Number
+    Default: 3
+    MinValue: 3
+  NodeDiskSize:
+    Type: Number
+    Default: 100
+  RDSInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium, db.t4g.large, db.r6g.large]
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First AZ for public subnet and nodes
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second AZ for public subnet (NLB requires 2 AZs)
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # VPC
+  # ---------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub openchoreo-${AWS::StackName}
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone1
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: !Sub kubernetes.io/cluster/${AWS::StackName}
+          Value: shared
+
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone2
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: !Sub kubernetes.io/cluster/${AWS::StackName}
+          Value: shared
+
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone1
+      CidrBlock: 10.0.3.0/24
+      Tags:
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: !Sub kubernetes.io/cluster/${AWS::StackName}
+          Value: shared
+
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone2
+      CidrBlock: 10.0.4.0/24
+      Tags:
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: !Sub kubernetes.io/cluster/${AWS::StackName}
+          Value: shared
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+  NatGW:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PubSub1
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref PubRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+  PubRTA1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PubSub1
+      RouteTableId: !Ref PubRT
+  PubRTA2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PubSub2
+      RouteTableId: !Ref PubRT
+
+  PrivRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PrivRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW
+  PrivRTA1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivSub1
+      RouteTableId: !Ref PrivRT
+  PrivRTA2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivSub2
+      RouteTableId: !Ref PrivRT
+
+  # ---------------------------------------------------------------------------
+  # Elastic IPs for load balancers (4 total: 2 per NLB for dual-AZ)
+  # ---------------------------------------------------------------------------
+  CPEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-control-plane
+  CPEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-control-plane-2
+  DPEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-data-plane
+  DPEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-data-plane-2
+
+  # ---------------------------------------------------------------------------
+  # Cognito
+  # ---------------------------------------------------------------------------
+  PreTokenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  PreTokenFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-pretoken
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt PreTokenRole.Arn
+      Timeout: 5
+      Code:
+        ZipFile: |
+          exports.handler = async (e) => {
+            const g = e.request.groupConfiguration.groupsToOverride || [];
+            e.response = {claimsOverrideDetails: {claimsToAddOrOverride: {groups: g.join(' ')}, groupOverrideDetails: {groupsToOverride: g}}};
+            return e;
+          };
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-openchoreo
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'OFF'
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt PreTokenFn.Arn
+
+  PreTokenPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PreTokenFn.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  PoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-auth
+      UserPoolId: !Ref UserPool
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: admin, UserPoolId: !Ref UserPool, Precedence: 0}
+  DevGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: developer, UserPoolId: !Ref UserPool, Precedence: 10}
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: viewer, UserPoolId: !Ref UserPool, Precedence: 20}
+
+  BackstageClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: openchoreo-backstage
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH]
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, profile, email]
+      CallbackURLs:
+        - !Sub https://console.${BaseDomain}/api/auth/openchoreo-auth/handler/frame
+      LogoutURLs:
+        - !Sub https://console.${BaseDomain}
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      RefreshTokenValidity: 30
+      TokenValidityUnits: {AccessToken: hours, IdToken: hours, RefreshToken: days}
+
+  CLIClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: openchoreo-cli
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH]
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, profile, email]
+      CallbackURLs: [http://localhost:8085/callback]
+      PreventUserExistenceErrors: ENABLED
+
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminEmail
+      DesiredDeliveryMediums: [EMAIL]
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminEmail
+        - Name: email_verified
+          Value: 'true'
+
+  AdminUserGroup:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    DependsOn: [AdminUser, AdminGroup]
+    Properties:
+      GroupName: admin
+      Username: !Ref AdminEmail
+      UserPoolId: !Ref UserPool
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager
+  # ---------------------------------------------------------------------------
+  RDSMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/database/master
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"openchoreo_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  BackstageDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/database/backstage
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"backstage_user","database":"backstage_db"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  BackstageBackendSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/backstage/backend-secret
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: backend-secret
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'''
+
+  CognitoClientSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: BackstageClient
+    Properties:
+      Name: !Sub ${AWS::StackName}/cognito/backstage-client
+      SecretString: !Sub '{"client_id":"${BackstageClient}","client_secret":"PLACEHOLDER"}'
+
+  # ---------------------------------------------------------------------------
+  # EKS
+  # ---------------------------------------------------------------------------
+  EKSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-eks-cluster
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-eks-node
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ClusterSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS cluster SG
+      VpcId: !Ref VPC
+  NodeSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS node SG
+      VpcId: !Ref VPC
+      Tags:
+        - Key: !Sub kubernetes.io/cluster/${AWS::StackName}
+          Value: owned
+  NodeSGSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSG
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref NodeSG
+  NodeSGFromCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSG
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ClusterSG
+  ClusterSGFromNode:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NodeSG
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref AWS::StackName
+      Version: !Ref EKSVersion
+      RoleArn: !GetAtt EKSRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: [!Ref PubSub1, !Ref PubSub2, !Ref PrivSub1, !Ref PrivSub2]
+        SecurityGroupIds: [!Ref ClusterSG]
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      NodegroupName: !Sub ${AWS::StackName}-nodes
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: [!Ref PrivSub1, !Ref PrivSub2]
+      ScalingConfig:
+        MinSize: !Ref NodeCount
+        MaxSize: 10
+        DesiredSize: !Ref NodeCount
+      InstanceTypes: [!Ref NodeInstanceType]
+      DiskSize: !Ref NodeDiskSize
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      Labels: {role: worker}
+      UpdateConfig:
+        MaxUnavailablePercentage: 33
+
+  OIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    DependsOn: Cluster
+    Properties:
+      Url: !GetAtt Cluster.OpenIdConnectIssuerUrl
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [9e99a48a9960b14926bb7f3b02e22da2b0ab7280]
+
+  # EKS Addons
+  VpcCni:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties: {ClusterName: !Ref AWS::StackName, AddonName: vpc-cni, ResolveConflicts: OVERWRITE}
+  CoreDns:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties: {ClusterName: !Ref AWS::StackName, AddonName: coredns, ResolveConflicts: OVERWRITE}
+  KubeProxy:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties: {ClusterName: !Ref AWS::StackName, AddonName: kube-proxy, ResolveConflicts: OVERWRITE}
+  EbsCsi:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup, EBSCSIRole]
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      ServiceAccountRoleArn: !GetAtt EBSCSIRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # IRSA roles
+  # ---------------------------------------------------------------------------
+  EBSCSIRole:
+    Type: AWS::IAM::Role
+    DependsOn: OIDCProvider
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-ebs-csi
+      AssumeRolePolicyDocument: !Sub
+        - '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"${A}"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"${U}:aud":"sts.amazonaws.com"},"StringLike":{"${U}:sub":"system:serviceaccount:kube-system:ebs-csi-*"}}}]}'
+        - A: !GetAtt OIDCProvider.Arn
+          U: !Select [1, !Split ['://', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy]
+
+  LBCPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-lbc
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeAccountAttributes
+              - ec2:DescribeAddresses
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeInstances
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeTags
+              - ec2:DescribeVpcPeeringConnections
+              - ec2:DescribeCoipPools
+              - ec2:GetCoipPoolUsage
+            Resource: '*'
+          - Effect: Allow
+            Action: [ec2:CreateSecurityGroup, ec2:CreateTags, ec2:DeleteTags]
+            Resource: '*'
+          - Effect: Allow
+            Action: [ec2:AuthorizeSecurityGroupIngress, ec2:RevokeSecurityGroupIngress, ec2:DeleteSecurityGroup]
+            Resource: '*'
+          - Effect: Allow
+            Action: [elasticloadbalancing:*]
+            Resource: '*'
+          - Effect: Allow
+            Action: [iam:CreateServiceLinkedRole]
+            Resource: '*'
+            Condition:
+              StringEquals: {iam:AWSServiceName: elasticloadbalancing.amazonaws.com}
+          - Effect: Allow
+            Action: [cognito-idp:DescribeUserPoolClient, acm:ListCertificates, acm:DescribeCertificate]
+            Resource: '*'
+          - Effect: Allow
+            Action: [waf-regional:*, wafv2:*, shield:*]
+            Resource: '*'
+
+  LBCRole:
+    Type: AWS::IAM::Role
+    DependsOn: OIDCProvider
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lbc
+      AssumeRolePolicyDocument: !Sub
+        - '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"${A}"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"${U}:aud":"sts.amazonaws.com","${U}:sub":"system:serviceaccount:kube-system:aws-load-balancer-controller"}}}]}'
+        - A: !GetAtt OIDCProvider.Arn
+          U: !Select [1, !Split ['://', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns: [!Ref LBCPolicy]
+
+  ESOPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-eso
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/*
+
+  ESORole:
+    Type: AWS::IAM::Role
+    DependsOn: OIDCProvider
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-eso
+      AssumeRolePolicyDocument: !Sub
+        - '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"${A}"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"${U}:aud":"sts.amazonaws.com","${U}:sub":"system:serviceaccount:external-secrets:external-secrets-sa"}}}]}'
+        - A: !GetAtt OIDCProvider.Arn
+          U: !Select [1, !Split ['://', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns: [!Ref ESOPolicy]
+
+  BuildPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-build
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [ecr:GetAuthorizationToken]
+            Resource: '*'
+          - Effect: Allow
+            Action: [ecr:CreateRepository, ecr:DescribeRepositories, ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:PutImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload]
+            Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/openchoreo-builds/*
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    DependsOn: OIDCProvider
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-build
+      AssumeRolePolicyDocument: !Sub
+        - '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"${A}"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"${U}:aud":"sts.amazonaws.com"},"StringLike":{"${U}:sub":["system:serviceaccount:openchoreo-build-plane:workflow-sa","system:serviceaccount:openchoreo-ci-*:workflow-sa"]}}}]}'
+        - A: !GetAtt OIDCProvider.Arn
+          U: !Select [1, !Split ['://', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns: [!Ref BuildPolicy]
+
+  # ---------------------------------------------------------------------------
+  # RDS
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: OpenChoreo RDS
+      SubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt Cluster.ClusterSecurityGroupId
+
+  DB:
+    Type: AWS::RDS::DBInstance
+    DependsOn: RDSMasterSecret
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-db
+      DBInstanceClass: !Ref RDSInstanceClass
+      Engine: postgres
+      EngineVersion: '17.2'
+      MasterUsername: !Sub '{{resolve:secretsmanager:${AWS::StackName}/database/master:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AWS::StackName}/database/master:SecretString:password}}'
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSG]
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: sun:04:00-sun:05:00
+      PubliclyAccessible: false
+      DeletionProtection: true
+      CopyTagsToSnapshot: true
+
+  # ---------------------------------------------------------------------------
+  # ECR
+  # ---------------------------------------------------------------------------
+  ECR:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: openchoreo-builds
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EncryptionConfiguration: {EncryptionType: AES256}
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":100},"action":{"type":"expire"}}]}'
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild (bootstrap + cleanup)
+  # ---------------------------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codebuild
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codebuild-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:ListUserPoolClients
+                  - cognito-idp:CreateResourceServer
+                  - cognito-idp:DeleteResourceServer
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:DeleteUserPoolClient
+                Resource: !GetAtt UserPool.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:DeleteSecret
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/*
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:registry-push-secret*
+              - Effect: Allow
+                Action:
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                Resource: !GetAtt ESORole.Arn
+              - Effect: Allow
+                Action:
+                  - rds:ModifyDBInstance
+                Resource: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${AWS::StackName}-db
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*
+
+  CodeBuildAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    DependsOn: [Cluster, NodeGroup]
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      PrincipalArn: !GetAtt CodeBuildRole.Arn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  BootstrapProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-bootstrap
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 120
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: OPENCHOREO_VERSION
+            Value: !Ref OpenChoreoVersion
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && mv kubectl /usr/local/bin/
+                - curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            build:
+              commands:
+                - RELEASE_BRANCH="release-v${OPENCHOREO_VERSION%.*}"
+                - git clone --depth 1 --branch "$RELEASE_BRANCH" https://github.com/isala404/openchoreo.git /tmp/openchoreo
+                - chmod +x /tmp/openchoreo/aws-marketplace/bootstrap.sh
+                - /tmp/openchoreo/aws-marketplace/bootstrap.sh
+
+  CleanupProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-cleanup
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 30
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: OPENCHOREO_VERSION
+            Value: !Ref OpenChoreoVersion
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && mv kubectl /usr/local/bin/
+                - curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            build:
+              commands:
+                - RELEASE_BRANCH="release-v${OPENCHOREO_VERSION%.*}"
+                - git clone --depth 1 --branch "$RELEASE_BRANCH" https://github.com/isala404/openchoreo.git /tmp/openchoreo
+                - chmod +x /tmp/openchoreo/aws-marketplace/cleanup.sh
+                - /tmp/openchoreo/aws-marketplace/cleanup.sh
+
+  # ---------------------------------------------------------------------------
+  # Lambda trigger + WaitCondition (bootstrap orchestration)
+  # ---------------------------------------------------------------------------
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: trigger-codebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BootstrapProject.Arn
+                  - !GetAtt CleanupProject.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  TriggerLambdaFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-trigger
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BOOTSTRAP_PROJECT: !Ref BootstrapProject
+          CLEANUP_PROJECT: !Ref CleanupProject
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import urllib.request
+
+          codebuild = boto3.client('codebuild')
+
+          def send_cfn_response(event, status, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'{status} via Lambda',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', event['LogicalResourceId']),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+              }).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                          headers={'Content-Type': ''})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              print(json.dumps(event))
+              request_type = event['RequestType']
+
+              if request_type == 'Create':
+                  wait_url = event['ResourceProperties'].get('WaitConditionUrl', '')
+                  try:
+                      codebuild.start_build(
+                          projectName=os.environ['BOOTSTRAP_PROJECT'],
+                          environmentVariablesOverride=[
+                              {'name': 'WAIT_CONDITION_URL', 'value': wait_url, 'type': 'PLAINTEXT'},
+                          ],
+                      )
+                  except Exception as e:
+                      send_cfn_response(event, 'FAILED', f'Failed to start bootstrap: {e}')
+                      return
+                  send_cfn_response(event, 'SUCCESS')
+
+              elif request_type == 'Delete':
+                  try:
+                      codebuild.start_build(
+                          projectName=os.environ['CLEANUP_PROJECT'],
+                          environmentVariablesOverride=[
+                              {'name': 'CFN_RESPONSE_URL', 'value': event['ResponseURL'], 'type': 'PLAINTEXT'},
+                              {'name': 'CFN_PHYSICAL_ID', 'value': event.get('PhysicalResourceId', event['LogicalResourceId']), 'type': 'PLAINTEXT'},
+                              {'name': 'CFN_STACK_ID', 'value': event['StackId'], 'type': 'PLAINTEXT'},
+                              {'name': 'CFN_REQUEST_ID', 'value': event['RequestId'], 'type': 'PLAINTEXT'},
+                              {'name': 'CFN_LOGICAL_ID', 'value': event['LogicalResourceId'], 'type': 'PLAINTEXT'},
+                          ],
+                      )
+                      # Do NOT respond here. CodeBuild cleanup sends the response after finishing.
+                  except Exception as e:
+                      # If CodeBuild fails to start, respond so CF doesn't hang forever
+                      send_cfn_response(event, 'SUCCESS', f'Cleanup build failed to start: {e}')
+
+              elif request_type == 'Update':
+                  send_cfn_response(event, 'SUCCESS')
+
+  BootstrapWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  BootstrapWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: TriggerBootstrap
+    Properties:
+      Handle: !Ref BootstrapWaitHandle
+      Timeout: '7200'
+      Count: 1
+
+  TriggerBootstrap:
+    Type: Custom::BootstrapTrigger
+    DependsOn: [Cluster, NodeGroup, DB, OIDCProvider, CodeBuildAccessEntry, VpcCni, CoreDns, KubeProxy, EbsCsi]
+    Properties:
+      ServiceToken: !GetAtt TriggerLambdaFn.Arn
+      WaitConditionUrl: !Ref BootstrapWaitHandle
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${AWS::StackName}-ClusterName
+  ClusterEndpoint:
+    Value: !GetAtt Cluster.Endpoint
+  VpcId:
+    Value: !Ref VPC
+  PublicSubnets:
+    Value: !Sub ${PubSub1},${PubSub2}
+  PrivateSubnets:
+    Value: !Sub ${PrivSub1},${PrivSub2}
+  DBEndpoint:
+    Value: !GetAtt DB.Endpoint.Address
+  ECRUri:
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/openchoreo-builds
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-CognitoUserPoolId
+  CognitoIssuerUrl:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+  CognitoJwksUrl:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/jwks.json
+  CognitoDomainUrl:
+    Value: !Sub https://${AWS::StackName}-auth.auth.${AWS::Region}.amazoncognito.com
+  BackstageClientId:
+    Value: !Ref BackstageClient
+  CLIClientId:
+    Value: !Ref CLIClient
+  CPEIPAllocationId:
+    Value: !GetAtt CPEIP.AllocationId
+  CPEIPAddress:
+    Value: !Ref CPEIP
+  CPEIP2AllocationId:
+    Value: !GetAtt CPEIP2.AllocationId
+  DPEIPAllocationId:
+    Value: !GetAtt DPEIP.AllocationId
+  DPEIPAddress:
+    Value: !Ref DPEIP
+  DPEIP2AllocationId:
+    Value: !GetAtt DPEIP2.AllocationId
+  ESORoleArn:
+    Value: !GetAtt ESORole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ESORoleArn
+  LBCRoleArn:
+    Value: !GetAtt LBCRole.Arn
+  BuildRoleArn:
+    Value: !GetAtt BuildRole.Arn
+  EBSCSIRoleArn:
+    Value: !GetAtt EBSCSIRole.Arn
+  SecretsPrefix:
+    Value: !Ref AWS::StackName
+  OIDCIssuerHost:
+    Value: !Select [1, !Split ['://', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+    Export:
+      Name: !Sub ${AWS::StackName}-OIDCIssuerHost
+  BaseDomain:
+    Value: !Ref BaseDomain
+    Export:
+      Name: !Sub ${AWS::StackName}-BaseDomain
+  ConsoleURL:
+    Value: !Sub https://console.${BaseDomain}
+    Description: OpenChoreo console (self-signed TLS initially)
+  APIURL:
+    Value: !Sub https://api.${BaseDomain}
+  ControlPlaneIP:
+    Value: !Ref CPEIP
+  DataPlaneIP:
+    Value: !Ref DPEIP
+  DNSInstructions:
+    Value: !Sub |
+      Create these DNS A records with your DNS provider:
+        console.${BaseDomain}  ->  ${CPEIP}
+        api.${BaseDomain}      ->  ${CPEIP}
+        *.apps.${BaseDomain}   ->  ${DPEIP}
