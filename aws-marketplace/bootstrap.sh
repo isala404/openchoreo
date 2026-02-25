@@ -635,14 +635,17 @@ envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --inst
   --timeout 15m \
   -f -
 
-log "Installing observability-logs-opensearch module..."
-# Install without --wait so helm doesn't block on the post-install setup job.
-# The setup job needs OpenSearch running, which takes several minutes to start.
+log "Installing observability-logs-opensearch module (skipping hooks)..."
+# Helm always waits for hook jobs, and the opensearch-setup-logs hook needs
+# OpenSearch running. Install without hooks first, wait for OpenSearch, then
+# run an upgrade to trigger the post-upgrade hook with OpenSearch already up.
 helm upgrade --install observability-logs-opensearch \
   oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
   --namespace openchoreo-observability-plane \
   --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
-  --timeout 15m
+  --no-hooks \
+  --timeout 15m \
+  --wait
 
 # Wait for OpenSearch cluster pods to be ready
 log "Waiting for OpenSearch cluster pods to be ready..."
@@ -657,25 +660,14 @@ for i in $(seq 1 90); do
   sleep 10
 done
 
-# Check if the setup job succeeded, if not delete and recreate it
-SETUP_JOB=$(kubectl get jobs -n openchoreo-observability-plane -o name 2>/dev/null | grep opensearch-setup-logs || true)
-if [[ -n "$SETUP_JOB" ]]; then
-  JOB_STATUS=$(kubectl get "$SETUP_JOB" -n openchoreo-observability-plane -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
-  if [[ "$JOB_STATUS" != "True" ]]; then
-    log "Setup job hasn't completed yet, deleting and recreating..."
-    kubectl delete "$SETUP_JOB" -n openchoreo-observability-plane 2>/dev/null || true
-    sleep 5
-    # Upgrade with same values re-triggers hooks
-    helm upgrade observability-logs-opensearch \
-      oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
-      --namespace openchoreo-observability-plane \
-      --reuse-values \
-      --timeout 10m \
-      --wait
-  else
-    log "Setup job already completed successfully"
-  fi
-fi
+# Now trigger the setup job via helm upgrade (post-upgrade hook)
+log "Running helm upgrade to trigger opensearch setup hooks..."
+helm upgrade observability-logs-opensearch \
+  oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
+  --namespace openchoreo-observability-plane \
+  --reuse-values \
+  --timeout 10m \
+  --wait
 
 log "Enabling fluent-bit on observability-logs-opensearch..."
 helm upgrade observability-logs-opensearch \
