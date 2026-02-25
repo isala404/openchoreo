@@ -45,8 +45,8 @@ wait_cert() {
 : "${DBEndpoint:?}" "${ECRUri:?}" "${CognitoUserPoolId:?}"
 : "${CognitoIssuerUrl:?}" "${CognitoJwksUrl:?}" "${CognitoDomainUrl:?}"
 : "${BackstageClientId:?}" "${CLIClientId:?}"
-: "${CPEIPAllocationId:?}" "${CPEIPAddress:?}" "${CPEIP2AllocationId:?}"
-: "${DPEIPAllocationId:?}" "${DPEIPAddress:?}" "${DPEIP2AllocationId:?}"
+: "${CPEIPAllocationId:?}" "${CPEIPAddress:?}"
+: "${DPEIPAllocationId:?}" "${DPEIPAddress:?}"
 : "${ESORoleArn:?}" "${LBCRoleArn:?}" "${BuildRoleArn:?}"
 
 export RELEASE_BRANCH="release-v${OPENCHOREO_VERSION%.*}"
@@ -378,9 +378,25 @@ export CLI_CLIENT_ID=$CLIClientId
 export BACKSTAGE_CLIENT_ID=$BackstageClientId
 export PUBLIC_SUBNETS="$PublicSubnets"
 
-# Use CF-managed EIPs for dual-AZ NLB
-export CP_EIP_ALLOCATIONS="${CPEIPAllocationId},${CPEIP2AllocationId}"
-export DP_EIP_ALLOCATIONS="${DPEIPAllocationId},${DPEIP2AllocationId}"
+# Allocate secondary EIPs for dual-AZ NLB coverage (NLB needs one EIP per AZ)
+CP_EIP2=$(aws ec2 allocate-address --domain vpc --region "$AWS_REGION" --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=${STACK_NAME}-cp-eip-2}]" --output json 2>/dev/null || true)
+CP_EIP2_ALLOC=$(echo "$CP_EIP2" | jq -r '.AllocationId // empty')
+if [[ -z "$CP_EIP2_ALLOC" ]]; then
+  warn "Could not allocate CP EIP2, using single-AZ NLB"
+  export CP_EIP_ALLOCATIONS="$CPEIPAllocationId"
+  export PUBLIC_SUBNETS=$(echo "$PublicSubnets" | cut -d, -f1)
+else
+  export CP_EIP_ALLOCATIONS="${CPEIPAllocationId},${CP_EIP2_ALLOC}"
+fi
+
+DP_EIP2=$(aws ec2 allocate-address --domain vpc --region "$AWS_REGION" --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=${STACK_NAME}-dp-eip-2}]" --output json 2>/dev/null || true)
+DP_EIP2_ALLOC=$(echo "$DP_EIP2" | jq -r '.AllocationId // empty')
+if [[ -z "$DP_EIP2_ALLOC" ]]; then
+  warn "Could not allocate DP EIP2, using single-AZ NLB"
+  export DP_EIP_ALLOCATIONS="$DPEIPAllocationId"
+else
+  export DP_EIP_ALLOCATIONS="${DPEIPAllocationId},${DP_EIP2_ALLOC}"
+fi
 
 envsubst < "${SCRIPT_DIR}/values/control-plane.yaml" | helm upgrade --install openchoreo-control-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \

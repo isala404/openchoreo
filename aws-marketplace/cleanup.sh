@@ -114,6 +114,17 @@ aws iam delete-role-policy \
   --policy-name registry-push-secret-access \
   2>/dev/null || true
 
+# Release secondary EIPs allocated at runtime for dual-AZ NLBs
+for tag_name in "${STACK_NAME}-cp-eip-2" "${STACK_NAME}-dp-eip-2"; do
+  EIP_ALLOC=$(aws ec2 describe-addresses --region "$AWS_REGION" \
+    --filters "Name=tag:Name,Values=${tag_name}" \
+    --query 'Addresses[0].AllocationId' --output text 2>/dev/null || true)
+  if [[ -n "$EIP_ALLOC" && "$EIP_ALLOC" != "None" ]]; then
+    aws ec2 release-address --allocation-id "$EIP_ALLOC" --region "$AWS_REGION" 2>/dev/null || true
+    log "Released EIP: ${tag_name}"
+  fi
+done
+
 # ── Step 5: Disable RDS deletion protection ──────────────────────────────────
 log "Step 5: Disabling RDS deletion protection..."
 
