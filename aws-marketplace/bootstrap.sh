@@ -635,24 +635,24 @@ envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --inst
   --timeout 15m \
   -f -
 
-log "Waiting for OpenSearch cluster to be ready..."
-for i in $(seq 1 60); do
-  PHASE=$(kubectl get opensearchclusters -n openchoreo-observability-plane -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
-  if [[ "$PHASE" == "RUNNING" ]]; then
-    log "OpenSearch cluster is running"
+log "Installing observability-logs-opensearch module..."
+# The opensearch-setup-logs post-install job may fail if OpenSearch pods aren't ready.
+# Retry up to 3 times with cleanup between attempts.
+for attempt in 1 2 3; do
+  if helm upgrade --install observability-logs-opensearch \
+    oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
+    --namespace openchoreo-observability-plane \
+    --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
+    --timeout 15m \
+    --wait 2>&1; then
     break
   fi
-  log "OpenSearch phase: ${PHASE:-unknown} (attempt $i/60)"
-  sleep 10
+  warn "observability-logs-opensearch attempt $attempt failed, retrying..."
+  # Delete failed hook jobs so helm can retry
+  kubectl delete jobs -n openchoreo-observability-plane -l app.kubernetes.io/instance=observability-logs-opensearch 2>/dev/null || true
+  helm uninstall observability-logs-opensearch -n openchoreo-observability-plane 2>/dev/null || true
+  sleep 30
 done
-
-log "Installing observability-logs-opensearch module..."
-helm upgrade --install observability-logs-opensearch \
-  oci://ghcr.io/openchoreo/charts/observability-logs-opensearch \
-  --namespace openchoreo-observability-plane \
-  --set openSearchSetup.openSearchSecretName="opensearch-admin-credentials" \
-  --timeout 15m \
-  --wait
 
 log "Enabling fluent-bit on observability-logs-opensearch..."
 helm upgrade observability-logs-opensearch \
