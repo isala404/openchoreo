@@ -79,6 +79,23 @@ else
   warn "Cannot connect to cluster. Skipping Kubernetes cleanup."
 fi
 
+# Clean up security groups created by AWS LBC (not removed by helm uninstall)
+if [[ -n "${VpcId:-}" ]]; then
+  for sg_id in $(aws ec2 describe-security-groups --region "$AWS_REGION" \
+    --filters "Name=vpc-id,Values=${VpcId}" "Name=tag:elbv2.k8s.aws/cluster,Values=${STACK_NAME}" \
+    --query 'SecurityGroups[*].GroupId' --output text 2>/dev/null || true); do
+    aws ec2 delete-security-group --group-id "$sg_id" --region "$AWS_REGION" 2>/dev/null || true
+    log "Deleted security group: ${sg_id}"
+  done
+  # Also delete SGs with k8s-tagged names that CF won't know about
+  for sg_id in $(aws ec2 describe-security-groups --region "$AWS_REGION" \
+    --filters "Name=vpc-id,Values=${VpcId}" "Name=group-name,Values=k8s-*" \
+    --query 'SecurityGroups[*].GroupId' --output text 2>/dev/null || true); do
+    aws ec2 delete-security-group --group-id "$sg_id" --region "$AWS_REGION" 2>/dev/null || true
+    log "Deleted k8s security group: ${sg_id}"
+  done
+fi
+
 # ── Step 4: Clean up manually-created AWS resources ──────────────────────────
 log "Step 4: Cleaning up AWS resources..."
 
