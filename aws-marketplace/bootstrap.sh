@@ -378,6 +378,7 @@ export PUBLIC_SUBNETS="$PublicSubnets"
 
 # Allocate secondary EIPs for dual-AZ NLB coverage (NLB needs one EIP per AZ)
 FIRST_SUBNET=$(echo "$PublicSubnets" | cut -d, -f1)
+FIRST_SUBNET_AZ=$(aws ec2 describe-subnets --subnet-ids "$FIRST_SUBNET" --region "$AWS_REGION" --query 'Subnets[0].AvailabilityZone' --output text)
 
 CP_EIP2=$(aws ec2 allocate-address --domain vpc --region "$AWS_REGION" --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=${STACK_NAME}-cp-eip-2}]" --output json 2>/dev/null || true)
 CP_EIP2_ALLOC=$(echo "$CP_EIP2" | jq -r '.AllocationId // empty')
@@ -587,6 +588,21 @@ clusterAgent:
   tls:
     generateCerts: true
 EOF
+
+# Pin gateway pods to the NLB AZ when using single-subnet mode.
+# With IP targets, the NLB can only reach pods in enabled AZs.
+if [[ "$DP_SUBNETS" == "$FIRST_SUBNET" ]]; then
+  log "Single-AZ DP NLB: pinning gateway-default to ${FIRST_SUBNET_AZ}"
+  kubectl patch deployment gateway-default -n openchoreo-data-plane --type=strategic \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"topology.kubernetes.io/zone\":\"${FIRST_SUBNET_AZ}\"}}}}}"
+  kubectl rollout status deployment/gateway-default -n openchoreo-data-plane --timeout=120s
+fi
+if [[ "$CP_SUBNETS" == "$FIRST_SUBNET" ]]; then
+  log "Single-AZ CP NLB: pinning gateway-default to ${FIRST_SUBNET_AZ}"
+  kubectl patch deployment gateway-default -n openchoreo-control-plane --type=strategic \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"topology.kubernetes.io/zone\":\"${FIRST_SUBNET_AZ}\"}}}}}"
+  kubectl rollout status deployment/gateway-default -n openchoreo-control-plane --timeout=120s
+fi
 
 # Wait for backstage to be ready
 log "Waiting for backstage..."
