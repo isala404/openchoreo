@@ -50,8 +50,6 @@ wait_cert() {
 : "${ESORoleArn:?}" "${LBCRoleArn:?}" "${BuildRoleArn:?}"
 
 export RELEASE_BRANCH="release-v${OPENCHOREO_VERSION%.*}"
-REPO_DIR="/tmp/openchoreo"
-SCRIPT_DIR="${REPO_DIR}/install/aws"
 export BASE_DOMAIN="$BaseDomain"
 
 log "Cluster: $ClusterName | CP IP: $CPEIPAddress | DP IP: $DPEIPAddress"
@@ -379,31 +377,107 @@ export BACKSTAGE_CLIENT_ID=$BackstageClientId
 export PUBLIC_SUBNETS="$PublicSubnets"
 
 # Allocate secondary EIPs for dual-AZ NLB coverage (NLB needs one EIP per AZ)
+FIRST_SUBNET=$(echo "$PublicSubnets" | cut -d, -f1)
+
 CP_EIP2=$(aws ec2 allocate-address --domain vpc --region "$AWS_REGION" --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=${STACK_NAME}-cp-eip-2}]" --output json 2>/dev/null || true)
 CP_EIP2_ALLOC=$(echo "$CP_EIP2" | jq -r '.AllocationId // empty')
 if [[ -z "$CP_EIP2_ALLOC" ]]; then
   warn "Could not allocate CP EIP2, using single-AZ NLB"
-  export CP_EIP_ALLOCATIONS="$CPEIPAllocationId"
-  export PUBLIC_SUBNETS=$(echo "$PublicSubnets" | cut -d, -f1)
+  CP_EIP_ALLOCATIONS="$CPEIPAllocationId"
+  CP_SUBNETS="$FIRST_SUBNET"
 else
-  export CP_EIP_ALLOCATIONS="${CPEIPAllocationId},${CP_EIP2_ALLOC}"
+  CP_EIP_ALLOCATIONS="${CPEIPAllocationId},${CP_EIP2_ALLOC}"
+  CP_SUBNETS="$PublicSubnets"
 fi
 
 DP_EIP2=$(aws ec2 allocate-address --domain vpc --region "$AWS_REGION" --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=${STACK_NAME}-dp-eip-2}]" --output json 2>/dev/null || true)
 DP_EIP2_ALLOC=$(echo "$DP_EIP2" | jq -r '.AllocationId // empty')
 if [[ -z "$DP_EIP2_ALLOC" ]]; then
   warn "Could not allocate DP EIP2, using single-AZ NLB"
-  export DP_EIP_ALLOCATIONS="$DPEIPAllocationId"
+  DP_EIP_ALLOCATIONS="$DPEIPAllocationId"
+  DP_SUBNETS="$FIRST_SUBNET"
 else
-  export DP_EIP_ALLOCATIONS="${DPEIPAllocationId},${DP_EIP2_ALLOC}"
+  DP_EIP_ALLOCATIONS="${DPEIPAllocationId},${DP_EIP2_ALLOC}"
+  DP_SUBNETS="$PublicSubnets"
 fi
 
-envsubst < "${SCRIPT_DIR}/values/control-plane.yaml" | helm upgrade --install openchoreo-control-plane \
+helm upgrade --install openchoreo-control-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-control-plane \
   --namespace openchoreo-control-plane \
   --version "$OPENCHOREO_VERSION" \
   --timeout 10m \
-  -f -
+  -f - <<EOF
+security:
+  oidc:
+    issuer: "${COGNITO_ISSUER_URL}"
+    wellKnownEndpoint: "${COGNITO_ISSUER_URL}/.well-known/openid-configuration"
+    jwksUrl: "${COGNITO_JWKS_URL}"
+    authorizationUrl: "${COGNITO_DOMAIN_URL}/oauth2/authorize"
+    tokenUrl: "${COGNITO_DOMAIN_URL}/oauth2/token"
+    externalClients:
+      - name: cli
+        client_id: "${CLI_CLIENT_ID}"
+        scopes:
+          - "openid"
+          - "profile"
+          - "email"
+
+openchoreoApi:
+  http:
+    hostnames:
+      - "api.${BASE_DOMAIN}"
+  config:
+    server:
+      publicUrl: "https://api.${BASE_DOMAIN}"
+    security:
+      subjects:
+        user:
+          mechanisms:
+            jwt:
+              entitlement:
+                claim: "cognito:groups"
+      authorization:
+        bootstrap:
+          mappings:
+            - name: super-admin-binding
+              roleRef: {name: super-admin}
+              entitlement: {claim: "cognito:groups", value: admin}
+              effect: allow
+            - name: backstage-catalog-reader-binding
+              roleRef: {name: backstage-catalog-reader}
+              entitlement: {claim: sub, value: "${BACKEND_CLIENT_ID}"}
+              effect: allow
+
+gateway:
+  infrastructure:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+      service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "${CP_EIP_ALLOCATIONS}"
+      service.beta.kubernetes.io/aws-load-balancer-subnets: "${CP_SUBNETS}"
+      service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+  tls:
+    hostname: "*.${BASE_DOMAIN}"
+    certificateRefs:
+      - name: control-plane-tls
+
+backstage:
+  secretName: openchoreo-backstage-secrets
+  baseUrl: "https://console.${BASE_DOMAIN}"
+  http:
+    hostnames:
+      - "console.${BASE_DOMAIN}"
+  auth:
+    clientId: ${BACKSTAGE_CLIENT_ID}
+  database:
+    type: postgresql
+    postgresql:
+      ssl: true
+  extraEnv:
+    - name: NODE_TLS_REJECT_UNAUTHORIZED
+      value: "0"
+EOF
 
 # Backstage CI config with backend client credentials
 BACKEND_CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client \
@@ -429,6 +503,10 @@ openchoreo:
       - "openchoreo-api/internal"
 CIEOF
 )" --dry-run=client -o yaml | kubectl apply -f -
+
+# subPath mounts don't auto-update, so restart backstage to pick up the new config
+kubectl rollout restart deployment/backstage -n openchoreo-control-plane
+kubectl rollout status deployment/backstage -n openchoreo-control-plane --timeout=120s
 
 # ── Step 15: Self-signed TLS certificates ────────────────────────────────────
 log "Step 15: Creating self-signed TLS certificates..."
@@ -484,12 +562,31 @@ done
 # ── Step 17: Install Data Plane ──────────────────────────────────────────────
 log "Step 17: Installing Data Plane..."
 
-envsubst < "${SCRIPT_DIR}/values/data-plane.yaml" | helm upgrade --install openchoreo-data-plane \
+helm upgrade --install openchoreo-data-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-data-plane \
   --namespace openchoreo-data-plane \
   --version "$OPENCHOREO_VERSION" \
   --timeout 10m \
-  -f -
+  -f - <<EOF
+gateway:
+  infrastructure:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+      service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "${DP_EIP_ALLOCATIONS}"
+      service.beta.kubernetes.io/aws-load-balancer-subnets: "${DP_SUBNETS}"
+      service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+  tls:
+    hostname: "*.apps.${BASE_DOMAIN}"
+    certificateRefs:
+      - name: data-plane-tls
+
+clusterAgent:
+  planeID: dataplane
+  tls:
+    generateCerts: true
+EOF
 
 # Wait for backstage to be ready
 log "Waiting for backstage..."
@@ -535,7 +632,15 @@ helm upgrade --install openchoreo-build-plane \
   --namespace openchoreo-build-plane \
   --version "$OPENCHOREO_VERSION" \
   --timeout 10m \
-  -f "${SCRIPT_DIR}/values/build-plane.yaml"
+  -f - <<EOF
+clusterAgent:
+  planeID: buildplane
+  tls:
+    generateCerts: true
+
+openbao:
+  enabled: false
+EOF
 
 # ── Step 20: Register BuildPlane ─────────────────────────────────────────────
 log "Step 20: Registering BuildPlane..."
@@ -566,7 +671,86 @@ log "Step 21: Setting up workflow templates..."
 kubectl apply -f "https://raw.githubusercontent.com/openchoreo/openchoreo/${RELEASE_BRANCH}/samples/getting-started/workflow-templates/checkout-source.yaml"
 kubectl apply -f "https://raw.githubusercontent.com/openchoreo/openchoreo/${RELEASE_BRANCH}/samples/getting-started/workflow-templates.yaml"
 
-envsubst '${ECR_REGISTRY} ${AWS_REGION}' < "${SCRIPT_DIR}/publish-image-ecr.yaml" | kubectl apply -f -
+cat <<EOF | kubectl apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: publish-image
+spec:
+  templates:
+    - name: publish-image
+      inputs:
+        parameters:
+          - name: git-revision
+      outputs:
+        parameters:
+          - name: image
+            valueFrom:
+              path: /tmp/image.txt
+      volumes:
+        - name: ecr-auth
+          emptyDir: {}
+      initContainers:
+        - name: ecr-login
+          image: amazon/aws-cli:latest
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              REPO_NAME="openchoreo-builds/{{workflow.parameters.image-name}}"
+              aws ecr describe-repositories --repository-names "\$REPO_NAME" --region ${AWS_REGION} 2>/dev/null || \
+                aws ecr create-repository --repository-name "\$REPO_NAME" --region ${AWS_REGION}
+              aws ecr get-login-password --region ${AWS_REGION} > /ecr-auth/token
+          volumeMounts:
+            - name: ecr-auth
+              mountPath: /ecr-auth
+      container:
+        image: ghcr.io/openchoreo/podman-runner:v1.0
+        command:
+          - sh
+          - -c
+        args:
+          - |-
+            set -e
+
+            GIT_REVISION={{inputs.parameters.git-revision}}
+            IMAGE_NAME={{workflow.parameters.image-name}}
+            IMAGE_TAG={{workflow.parameters.image-tag}}
+            SRC_IMAGE="\${IMAGE_NAME}:\${IMAGE_TAG}-\${GIT_REVISION}"
+
+            REGISTRY_ENDPOINT="${ECR_REGISTRY}/openchoreo-builds"
+
+            mkdir -p /etc/containers
+            cat <<SEOF > /etc/containers/storage.conf
+            [storage]
+            driver = "overlay"
+            runroot = "/run/containers/storage"
+            graphroot = "/var/lib/containers/storage"
+            [storage.options.overlay]
+            mount_program = "/usr/bin/fuse-overlayfs"
+            SEOF
+
+            podman load -i /mnt/vol/app-image.tar
+
+            podman tag \$SRC_IMAGE \$REGISTRY_ENDPOINT/\$SRC_IMAGE
+
+            cat /ecr-auth/token | podman login --username AWS --password-stdin ${ECR_REGISTRY}
+
+            podman push --tls-verify=true \$REGISTRY_ENDPOINT/\$SRC_IMAGE
+
+            echo -n "\$REGISTRY_ENDPOINT/\$SRC_IMAGE" > /tmp/image.txt
+        env:
+          - name: ECR_REGISTRY
+            value: "${ECR_REGISTRY}"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /ecr-auth
+            name: ecr-auth
+            readOnly: true
+EOF
 
 kubectl create namespace openchoreo-ci-default --dry-run=client -o yaml | kubectl apply -f -
 
@@ -628,12 +812,72 @@ kubectl create secret generic opensearch-admin-credentials \
   --from-literal=password=ThisIsTheOpenSearchPassword1 \
   --dry-run=client -o yaml | kubectl apply -f -
 
-envsubst < "${SCRIPT_DIR}/values/observability-plane.yaml" | helm upgrade --install openchoreo-observability-plane \
+helm upgrade --install openchoreo-observability-plane \
   oci://ghcr.io/openchoreo/helm-charts/openchoreo-observability-plane \
   --namespace openchoreo-observability-plane \
   --version "$OPENCHOREO_VERSION" \
   --timeout 15m \
-  -f -
+  -f - <<EOF
+security:
+  oidc:
+    jwksUrl: "${COGNITO_JWKS_URL}"
+    tokenUrl: "${COGNITO_DOMAIN_URL}/oauth2/token"
+
+clusterAgent:
+  planeID: observabilityplane
+  tls:
+    generateCerts: true
+
+observer:
+  openSearchSecretName: observer-opensearch-credentials
+  controlPlaneApiUrl: "http://openchoreo-api.openchoreo-control-plane.svc.cluster.local:8080"
+  extraEnvs:
+    - name: OBSERVER_BASE_URL
+      value: "http://localhost:11080"
+    - name: OPENSEARCH_ADDRESS
+      value: "https://opensearch:9200"
+    - name: PROMETHEUS_ADDRESS
+      value: "http://openchoreo-observability-prometheus:9091"
+    - name: PROMETHEUS_TIMEOUT
+      value: "30s"
+    - name: AUTHZ_TIMEOUT
+      value: "30s"
+    - name: AUTH_SERVER_BASE_URL
+      value: "${COGNITO_DOMAIN_URL}"
+  security:
+    userTypes:
+      - type: "user"
+        display_name: "User"
+        priority: 1
+        auth_mechanisms:
+          - type: "jwt"
+            entitlement:
+              claim: "cognito:groups"
+              display_name: "User Group"
+      - type: "service_account"
+        display_name: "Service Account"
+        priority: 2
+        auth_mechanisms:
+          - type: "jwt"
+            entitlement:
+              claim: "sub"
+              display_name: "Client ID"
+
+gateway:
+  enabled: false
+
+openSearchCluster:
+  enabled: false
+
+fluent-bit:
+  enabled: false
+
+opentelemetry-collector:
+  enabled: false
+
+openSearch:
+  enabled: false
+EOF
 
 log "Installing observability-logs-opensearch module (skipping hooks)..."
 # Helm always waits for hook jobs, and the opensearch-setup-logs hook needs
