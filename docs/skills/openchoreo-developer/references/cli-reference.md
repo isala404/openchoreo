@@ -54,8 +54,13 @@ Service account login: `occ login --client-credentials --client-id <id> --client
 
 ## Global Flags
 
-All commands accept: `--namespace`, `--project`, `--component`, `--environment`, `--dataplane`
-These override context defaults.
+Do not assume flag support is uniform across `occ` subcommands. In practice:
+
+- many `list` commands accept scope flags such as `--project`
+- many `get` commands use `--namespace` and do not accept `--project`
+- `occ component workflow logs` accepts `--namespace` but not `--project`
+
+Use `--help` on the exact subcommand when scope handling matters. Context defaults often carry project selection more reliably than flags.
 
 ## Important: occ get returns YAML
 

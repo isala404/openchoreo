@@ -43,7 +43,7 @@ A deployable unit. References a ComponentType that defines how it's deployed. Th
 - `parameters`: Config values matching the ComponentType schema
 - `traits`: Optional composable capabilities
 - `autoDeploy`: When true, automatically creates releases when Workload changes
-- `build` or `workflow`: Build configuration for source-to-image
+- `workflow`: Build configuration for source-to-image on current Component resources
 
 **Example**: Each microservice, web frontend, or background job is a separate component.
 
@@ -78,7 +78,9 @@ Platform-engineer-defined template that controls how a component deploys. Develo
 
 **Two kinds of parameters**:
 - `parameters`: Static config, same everywhere the release deploys (e.g., image pull policy)
-- `envOverrides`: Can differ per environment via ReleaseBinding (e.g., replicas, CPU limits)
+- `envOverrides`: The per-environment part of the ComponentType schema
+
+ReleaseBinding supplies the actual per-environment values for that schema under `componentTypeEnvOverrides`.
 
 ### Trait
 Composable capability attached to components. Adds resources (like PVCs) or modifies existing ones (inject env vars, add volumes) without changing the ComponentType.

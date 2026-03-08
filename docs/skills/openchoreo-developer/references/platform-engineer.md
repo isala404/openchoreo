@@ -21,14 +21,14 @@ Platform engineers create ComponentTypes to define how components deploy. Each t
 
 **Schema**: Defines what parameters developers can set.
 ```yaml
-schema:
-  parameters:                      # static, same everywhere
-    replicas: "integer | default=1"
-    imagePullPolicy: "string | enum=Always,IfNotPresent,Never | default=IfNotPresent"
-  envOverrides:                    # environment-specific, set in ReleaseBinding
-    replicas: "integer | default=1 min=1 max=10"
-    cpuLimit: "string | default=500m"
-    memoryLimit: "string | default=256Mi"
+  schema:
+    parameters:                      # static, same everywhere
+      replicas: "integer | default=1"
+      imagePullPolicy: "string | enum=Always,IfNotPresent,Never | default=IfNotPresent"
+    envOverrides:                    # environment-specific schema; ReleaseBinding provides values via componentTypeEnvOverrides
+      replicas: "integer | default=1 min=1 max=10"
+      cpuLimit: "string | default=500m"
+      memoryLimit: "string | default=256Mi"
 ```
 
 Schema syntax: `"type | constraint1 constraint2"`
@@ -38,7 +38,7 @@ Schema syntax: `"type | constraint1 constraint2"`
 **Resource templates**: Kubernetes manifests with CEL expressions. Templates reference:
 - `metadata.*` - component name, namespace, labels, environment name
 - `parameters.*` - developer-provided static values
-- `envOverrides.*` - environment-specific values
+- `envOverrides.*` - environment-specific values from the ComponentType schema, populated by ReleaseBinding `componentTypeEnvOverrides`
 - `workload.*` - container image, endpoints, connections
 - `configurations.*` - config envs/files and secret envs/files
 - `dataplane.*` - secretStore name, publicVirtualHost
@@ -89,7 +89,7 @@ Patch operations: `add`, `replace`, `remove`
 Array filtering: `[?(@.name=='app')]` targets specific elements
 
 ### Schema
-Same structure as ComponentType: `parameters` (static) and `envOverrides` (per-environment).
+Same structure as ComponentType: `parameters` (static) and `envOverrides` (per-environment schema values supplied through ReleaseBinding overrides).
 
 **Scope variants**:
 - `Trait` - namespace-scoped
