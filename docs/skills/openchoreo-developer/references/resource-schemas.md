@@ -251,6 +251,40 @@ spec:
 - `ReleaseBinding` is usually created by `occ component deploy`; hand-write it only when you need explicit overrides.
 - Current `state` values used by the CRD are `Active` and `Undeploy`.
 - Deployed endpoint URLs appear in `status.endpoints[].invokeURL`, `externalURLs`, and `internalURLs`.
+- `workloadOverrides.container.env` entries match by `key` and **replace** the base Workload entry. A literal `value` override completely replaces a `valueFrom.secretRef` base. Entries not listed in overrides are unchanged. See the deployment guide for the per-environment secrets pattern.
+
+## WorkflowRun
+
+For triggering builds or standalone workflows declaratively:
+
+```yaml
+apiVersion: openchoreo.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: my-app-build-01
+  namespace: default
+  labels:
+    openchoreo.dev/project: my-project      # required for component workflows
+    openchoreo.dev/component: my-app        # required for component workflows
+spec:
+  workflow:
+    name: docker
+    parameters:
+      repository:
+        url: "https://github.com/org/repo"
+        revision:
+          branch: "main"
+        appPath: "."
+      docker:
+        context: "."
+        filePath: "./Dockerfile"
+```
+
+**Notes**:
+- `openchoreo.dev/project` and `openchoreo.dev/component` labels are required for component build workflows. They link the build output (Workload CR) to the correct component.
+- Workflow parameters must match the schema from the referenced Workflow (`occ workflow get <name>`).
+- Each WorkflowRun name must be unique within the namespace.
+- For standalone (non-component) workflows, omit the component labels and use the standalone workflow's parameter schema.
 
 ## SecretReference
 

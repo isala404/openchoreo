@@ -105,6 +105,8 @@ spec:
 Trigger builds: `occ component workflow run my-app`
 Follow build logs: `occ component workflow logs my-app -f`
 
+**`autoDeploy` behavior**: `autoDeploy: true` triggers a deployment after a Workload is created or updated (i.e., after a successful build produces a new Workload CR). It does not trigger the build itself. Builds are triggered separately via `occ component workflow run` or declarative WorkflowRun resources.
+
 **Important path rule for multi-directory repos**: `repository.appPath` tells the workflow where the service source lives and where to find `workload.yaml`, but Docker workflow paths still need to match the actual repo layout. If the service lives under `backend/` with `backend/Dockerfile`, use `docker.context: ./backend` and `docker.filePath: ./backend/Dockerfile` or the equivalent leading-slash form used by repo samples. Do not assume `appPath: ./backend` makes `./Dockerfile` resolve inside that directory.
 
 **Important project rule for source builds**: Keep `spec.owner.projectName`, `spec.workflow.parameters.scope.projectName`, and the active `occ` context project aligned. If the workflow scope still points at `default`, the build can generate a Workload owned by the wrong project even when the Component itself lives in the right project.
@@ -261,6 +263,39 @@ occ component scaffold my-app --type deployment/web-application \
 
 The component name is positional. `occ component scaffold --name ...` is invalid.
 
+## Declarative Builds via WorkflowRun
+
+Instead of triggering builds through `occ component workflow run`, you can create WorkflowRun resources declaratively. This is useful for GitOps workflows where builds should be triggered by applying YAML rather than running CLI commands.
+
+```yaml
+apiVersion: openchoreo.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: my-app-build-01
+  namespace: default
+  labels:
+    openchoreo.dev/project: my-project
+    openchoreo.dev/component: my-app
+spec:
+  workflow:
+    name: docker
+    parameters:
+      repository:
+        url: https://github.com/org/repo
+        revision:
+          branch: main
+        appPath: .
+      docker:
+        context: .
+        filePath: ./Dockerfile
+```
+
+**Required labels**: `openchoreo.dev/project` and `openchoreo.dev/component` link the WorkflowRun to a Component. Without these labels, the build runs but the resulting Workload won't be associated with the right component.
+
+**Workflow parameters**: Must match the schema from the referenced Workflow. Use `occ workflow get <name>` to discover the parameter shape. The `scope` block used in Component `spec.workflow.parameters` is not needed here; the labels provide the component context.
+
+**Naming**: Each WorkflowRun name must be unique. A common pattern is `{component}-build-{nn}` with an incrementing suffix.
+
 ## Deploying and Promoting
 
 ```bash
@@ -303,6 +338,58 @@ spec:
         - key: LOG_LEVEL
           value: warn
 ```
+
+### workloadOverrides Replace Semantics
+
+`workloadOverrides.container.env` entries are matched by `key` and **replace** the corresponding entry from the base Workload. This means:
+
+- A literal `value` override completely replaces a `valueFrom.secretRef` base entry (and vice versa). This is how you swap secret names per environment.
+- Entries that don't appear in the override list are left unchanged from the base Workload.
+- Overrides do not append; they replace by key.
+
+This is the primary mechanism for per-environment secret swapping:
+
+```yaml
+# Base Workload has:
+#   - key: DB_HOST
+#     valueFrom:
+#       secretRef:
+#         name: db-secrets        # generic name in workload.yaml
+#         key: host
+
+# ReleaseBinding for production overrides the secret name:
+workloadOverrides:
+  container:
+    env:
+      - key: DB_HOST
+        valueFrom:
+          secretRef:
+            name: db-secrets-production    # env-specific SecretReference
+            key: host
+```
+
+### Per-Environment Secrets Pattern
+
+SecretReference resources are **not environment-scoped**. A single SecretReference always points to the same vault path regardless of which environment deploys it.
+
+To use different secrets per environment, create separate SecretReference resources with environment-specific names and vault paths, then swap them via ReleaseBinding workloadOverrides:
+
+```
+# SecretReferences (one per environment):
+db-secrets-dev       → vault: app/dev/database
+db-secrets-staging   → vault: app/staging/database
+db-secrets-prod      → vault: app/prod/database
+
+# workload.yaml base references a generic name:
+secretKeyRef.name: db-secrets
+
+# Each environment's ReleaseBinding overrides the secret name:
+dev ReleaseBinding     → secretRef.name: db-secrets-dev
+staging ReleaseBinding → secretRef.name: db-secrets-staging
+prod ReleaseBinding    → secretRef.name: db-secrets-prod
+```
+
+This keeps the base workload.yaml environment-agnostic while each deployment resolves to the correct vault path.
 
 ## Multi-Service Applications
 

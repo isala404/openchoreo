@@ -242,6 +242,58 @@ spec:
         # ...
 ```
 
+## WorkflowRun Resources
+
+WorkflowRun is the resource that triggers a Workflow execution. For component workflows, it links back to the component via labels.
+
+### Component WorkflowRun
+
+```yaml
+apiVersion: openchoreo.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: my-app-build-01
+  namespace: default
+  labels:
+    openchoreo.dev/project: my-project
+    openchoreo.dev/component: my-app
+spec:
+  workflow:
+    name: docker
+    parameters:
+      repository:
+        url: https://github.com/org/repo
+        revision:
+          branch: main
+        appPath: .
+      docker:
+        context: .
+        filePath: ./Dockerfile
+```
+
+The `openchoreo.dev/project` and `openchoreo.dev/component` labels are required. The WorkflowRun controller uses them to associate the build output (the `generate-workload-cr` step) with the correct Component. Without these labels, the Workload CR is created but not linked to any component.
+
+### Standalone WorkflowRun
+
+For non-component workflows (vault seeding, migrations, data processing):
+
+```yaml
+apiVersion: openchoreo.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: seed-vault-01
+  namespace: default
+spec:
+  workflow:
+    name: upsert-secrets
+    parameters:
+      secrets:
+        - key: app/dev/database
+          value: '{"host":"db.dev.internal","port":"5432","username":"app","password":"secret","database":"mydb"}'
+```
+
+Standalone WorkflowRuns don't need component labels. The parameter shape comes from the standalone Workflow's schema.
+
 ## CEL Expression Context
 
 All CEL expressions in ComponentType, Trait, and Workflow templates have access to these context variables:
